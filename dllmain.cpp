@@ -11,10 +11,23 @@
 #ifdef WIN32
 # define FEXPORT __declspec(dllexport)
 #else
-# define FEXPORT // empty
+# define FEXPORT __attribute__((visibility("default")))
 #endif
 
+namespace st {
+    bool Generate(const std::string&, const std::string&);
+    const std::string& LastImportError();
+}
 extern "C" {
+    // Small C interface for local automation and regression tests.
+    FEXPORT int ShadertoyImportProject(const char* id, const char* path) {
+        try { return st::Generate(id ? id : "", path ? path : "") ? 1 : 0; }
+        catch (...) { return 0; }
+    }
+    FEXPORT const char* ShadertoyImportLastError() {
+        return st::LastImportError().c_str();
+    }
+
 	FEXPORT st::Shadertoy* CreatePlugin() {
 		return new st::Shadertoy();
 	}
@@ -25,7 +38,7 @@ extern "C" {
 		return 3;
 	}
 	FEXPORT int GetPluginVersion() {
-		return 1;
+		return 2;
 	}
 	FEXPORT const char* GetPluginName() {
 		return "Shadertoy";

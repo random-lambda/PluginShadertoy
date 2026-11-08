@@ -3,8 +3,9 @@
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>
 
-#define CPPHTTPLIB_OPENSSL_SUPPORT
-#include <httplib/httplib.h>
+#include "HttpClient.h"
+#include <cstdlib>
+#include <stdexcept>
 #include <json11/json11.hpp>
 #include <pugixml/src/pugixml.hpp>
 #include <ghc/filesystem.hpp>
@@ -14,6 +15,8 @@
 
 namespace st
 {
+	static thread_local std::string importError;
+	const std::string& LastImportError() { return importError; }
 	struct ShaderOutput
 	{
 		int ID;
@@ -344,15 +347,29 @@ void main() {
 	void WriteFile(const std::string& filename, const std::string& filedata)
 	{
 		std::ofstream file(filename);
+		file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
 		file << filedata;
 		file.close();
 	}
 	bool Generate(const std::string& shadertoyID, const std::string& outPath)
 	{
-		// https://www.shadertoy.com/api/v1/shaders/shaderID?key=appkey
-		httplib::SSLClient cli("www.shadertoy.com");
-
-		auto res = cli.Get(("/api/v1/shaders/" + shadertoyID + "?key=" SHADERTOY_APIKEY).c_str());
+		importError.clear();
+		if (shadertoyID.empty() || shadertoyID.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") != std::string::npos || outPath.empty()) {
+			importError = "Supply a shader ID and output directory.";
+			return false;
+		}
+		const char* runtimeKey = std::getenv("SHADERTOY_API_KEY");
+		std::string apiKey = runtimeKey && *runtimeKey ? runtimeKey : SHADERTOY_APIKEY;
+		if (apiKey.empty()) {
+			importError = "Missing SHADERTOY_API_KEY. Set it before launching SHADERed.";
+			return false;
+		}
+		HttpClient cli;
+		auto res = cli.Get("/api/v1/shaders/" + shadertoyID + "?key=" + HttpClient::Escape(apiKey));
+		if (!res || res->status != 200) {
+			importError = res ? "Shadertoy API returned HTTP " + std::to_string(res->status) + ". Check access and API key." : cli.Error();
+			return false;
+		}
 
 		std::vector<RenderPass> pipeline;
 
@@ -360,7 +377,8 @@ void main() {
 			std::string err;
 			json11::Json jdata = json11::Json::parse(res->body, err);
 
-			if (jdata["Error"].is_string()) {
+			if (!err.empty() || !jdata["Shader"]["renderpass"].is_array() || jdata["Shader"]["renderpass"].array_items().empty()) {
+				importError = "API returned no usable shader passes. Check Public API visibility and API key.";
 				return false;
 			}
 
@@ -416,14 +434,14 @@ void main() {
 						if (!ghc::filesystem::exists(texPath))
 							ghc::filesystem::create_directories(ghc::filesystem::path(texPath).parent_path());
 
+						auto res = cli.Get(inp.Source);
+						if (!res || res->status != 200) {
+							importError = "A required texture download failed; the project is incomplete.";
+							return false;
+						}
 						std::ofstream texFile(texPath, std::ofstream::binary);
-
-						auto res = cli.Get(inp.Source.c_str());
-
-						if (res && res->status == 200)
-							texFile.write(res->body.c_str(), res->body.size());
-
-						texFile.close();
+						texFile.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+						texFile.write(res->body.data(), res->body.size());
 					}
 				}
 			}
@@ -437,6 +455,8 @@ void main() {
 
 	bool Shadertoy::Init(bool isWeb, int sedVersion) {
 		m_isPopupOpened = false;
+		m_errorOccured = false;
+		m_link[0] = m_path[0] = '\0';
 
 		if (sedVersion == 1003005)
 			m_hostVersion = 1;
@@ -485,7 +505,7 @@ void main() {
 			if (!m_errorOccured)
 				ImGui::NewLine();
 			else
-				ImGui::Text("[ERROR] %s", m_error.c_str()); 
+				ImGui::TextWrapped("[ERROR] %s", m_error.c_str());
 
 
 			if (ImGui::Button("Ok")) {
@@ -503,9 +523,11 @@ void main() {
 					if (outPath.size() == 0)
 						errMessage = "Please set the output path";
 					else {
-						bool res = Generate(id, outPath);
+						bool res = false;
+						try { res = Generate(id, outPath); }
+						catch (const std::exception&) { importError = "Import failed while writing the project or processing its data."; }
 						if (!res)
-							errMessage = "Shader either doesn't exist or doesn't have the PublicAPI flag set";
+							errMessage = LastImportError();
 						else
 							OpenProject(UI, (outPath + "/project.sprj").c_str());
 					}
